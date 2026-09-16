@@ -525,7 +525,7 @@
            \* lock. The prior owner keeps its handle on the old file, and every call it has in flight lands
            \* there - on a file no name reaches any more.
            with (r = FsCreate(fs, P, TakeoverName(self), self, TRUE)) {
-             if (r.ok) { fs := r.fs; }
+             if (r.ok) { fs := r.fs; goto S240_5_seed_lock; }
              else { refused[self] := "RESTART"; goto S240_5_close; };
            };
          };

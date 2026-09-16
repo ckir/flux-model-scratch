@@ -599,7 +599,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            \* lock. The prior owner keeps its handle on the old file, and every call it has in flight lands
            \* there - on a file no name reaches any more.
            with (r = FsCreate(fs, P, TakeoverName(self), self, TRUE)) {
-             if (r.ok) { fs := r.fs; }
+             if (r.ok) { fs := r.fs; goto S240_5_seed_lock; }
              else { refused[self] := "RESTART"; goto S240_5_close; };
            };
          };
@@ -1162,7 +1162,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "834541b3" /\ chksum(tla) = "a0edf8b0")
+\* BEGIN TRANSLATION (chksum(pcal) = "f6e4cfc9" /\ chksum(tla) = "22773410")
 \* Procedure variable obj of procedure Classify at line 188 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -2184,7 +2184,7 @@ S240_5_s6_seed(self) == /\ pc[self] = "S240_5_s6_seed"
                               ELSE /\ LET r == FsCreate(fs, P, TakeoverName(self), self, TRUE) IN
                                         IF r.ok
                                            THEN /\ fs' = r.fs
-                                                /\ pc' = [pc EXCEPT ![self] = "S240_5_s6_write_begin"]
+                                                /\ pc' = [pc EXCEPT ![self] = "S240_5_seed_lock"]
                                                 /\ UNCHANGED refused
                                            ELSE /\ refused' = [refused EXCEPT ![self] = "RESTART"]
                                                 /\ pc' = [pc EXCEPT ![self] = "S240_5_close"]
