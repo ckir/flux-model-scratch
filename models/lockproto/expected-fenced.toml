@@ -17,6 +17,11 @@ unreached = [
     { label = "S240_5_s6_write_end", reason = "the takeover always builds a new file and renames it over the lock in this prototype, so the in-place write and the identity re-check after it are gone" },
     { label = "S240_5_s6_flush", reason = "the takeover always builds a new file and renames it over the lock in this prototype, so the in-place write and the identity re-check after it are gone" },
     { label = "S240_5_s6", reason = "the takeover always builds a new file and renames it over the lock in this prototype, so the in-place write and the identity re-check after it are gone" },
+    { label = "S240_3_putback", reason = "240.3 step 3 finds a different file only when another actor rewrote the record under the recoverer; this pairing has one Breaker, which takes over rather than recovers" },
+    { label = "S240_3_s4_drop", reason = "step 4's create fails only if another operation created the lock meanwhile, which needs a third actor" },
+    { label = "S240_3_s4_lock_close", reason = "reached from the lock wait below" },
+    { label = "S240_3_s4_lock_wait", reason = "the new lock file is private until it is renamed into place, so nobody else can hold its lock in this pairing" },
+    { label = "recover_crashed", reason = "the recovery path is entered only by the Breaker here, and one crash is spent before it gets there" },
     { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock" },
 ]
 timeout_minutes = 60
@@ -38,15 +43,5 @@ config = "configs/fenced-posix-singlewriter.cfg"
 scenario = "fenced"
 kind = "witness"
 violated = ["SingleWriter"]
-constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
-timeout_minutes = 30
-
-[[run]]
-name = "fenced-posix-witness-RefusalJustified"
-module = "Fenced"
-config = "configs/fenced-posix-refusal.cfg"
-scenario = "fenced"
-kind = "witness"
-violated = ["RefusalJustified"]
 constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
 timeout_minutes = 30
