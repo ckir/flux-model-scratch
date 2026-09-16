@@ -524,7 +524,7 @@
            \* lock. The prior owner keeps its handle on the old file, and every call it has in flight lands
            \* there - on a file no name reaches any more.
            with (r = FsCreate(fs, P, TakeoverName(self), self, TRUE)) {
-             if (r.ok) { fs := r.fs; goto S240_5_seed_write_begin; }
+             if (r.ok) { fs := r.fs; }
              else { refused[self] := "RESTART"; goto S240_5_close; };
            };
          };
@@ -568,6 +568,19 @@
                return;
              };
          };
+         };
+       S240_5_seed_lock:
+         \* Take the new file's OS-native lock before writing it. Under a lease that can lapse, holding the
+         \* lock on the file you write is what makes a lost lease fail your writes instead of letting them
+         \* land unseen (measured: without this the takeover's own rewrite is fenced out).
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           if (LocksAvailable) {
+             with (r = FsTryLock(fs, self, At(fs, P, TakeoverName(self)))) {
+               if (r.ok) { fs := r.fs; }
+               else { refused[self] := "RESTART"; goto S240_5_close; };
+             };
+           };
          };
        S240_5_seed_write_begin:
          if (crashed[self]) { goto takeover_crashed; }

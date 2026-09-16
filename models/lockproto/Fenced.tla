@@ -598,7 +598,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            \* lock. The prior owner keeps its handle on the old file, and every call it has in flight lands
            \* there - on a file no name reaches any more.
            with (r = FsCreate(fs, P, TakeoverName(self), self, TRUE)) {
-             if (r.ok) { fs := r.fs; goto S240_5_seed_write_begin; }
+             if (r.ok) { fs := r.fs; }
              else { refused[self] := "RESTART"; goto S240_5_close; };
            };
          };
@@ -642,6 +642,19 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
                return;
              };
          };
+         };
+       S240_5_seed_lock:
+         \* Take the new file's OS-native lock before writing it. Under a lease that can lapse, holding the
+         \* lock on the file you write is what makes a lost lease fail your writes instead of letting them
+         \* land unseen (measured: without this the takeover's own rewrite is fenced out).
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           if (LocksAvailable) {
+             with (r = FsTryLock(fs, self, At(fs, P, TakeoverName(self)))) {
+               if (r.ok) { fs := r.fs; }
+               else { refused[self] := "RESTART"; goto S240_5_close; };
+             };
+           };
          };
        S240_5_seed_write_begin:
          if (crashed[self]) { goto takeover_crashed; }
@@ -1143,7 +1156,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "b889abad" /\ chksum(tla) = "6dd14a3e")
+\* BEGIN TRANSLATION (chksum(pcal) = "d538e63c" /\ chksum(tla) = "b3404f10")
 \* Procedure variable obj of procedure Classify at line 187 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -2146,7 +2159,7 @@ S240_5_s6_seed(self) == /\ pc[self] = "S240_5_s6_seed"
                               ELSE /\ LET r == FsCreate(fs, P, TakeoverName(self), self, TRUE) IN
                                         IF r.ok
                                            THEN /\ fs' = r.fs
-                                                /\ pc' = [pc EXCEPT ![self] = "S240_5_seed_write_begin"]
+                                                /\ pc' = [pc EXCEPT ![self] = "S240_5_s6_write_begin"]
                                                 /\ UNCHANGED refused
                                            ELSE /\ refused' = [refused EXCEPT ![self] = "RESTART"]
                                                 /\ pc' = [pc EXCEPT ![self] = "S240_5_close"]
@@ -2259,6 +2272,33 @@ S240_5_s6(self) == /\ pc[self] = "S240_5_s6"
                                    hostCrashChangedLock, touchedUncertain, 
                                    keep, obj_, got, obj, robj, victim, nobj, 
                                    crashes, leases >>
+
+S240_5_seed_lock(self) == /\ pc[self] = "S240_5_seed_lock"
+                          /\ IF crashed[self]
+                                THEN /\ pc' = [pc EXCEPT ![self] = "takeover_crashed"]
+                                     /\ UNCHANGED << fs, refused >>
+                                ELSE /\ IF LocksAvailable
+                                           THEN /\ LET r == FsTryLock(fs, self, At(fs, P, TakeoverName(self))) IN
+                                                     IF r.ok
+                                                        THEN /\ fs' = r.fs
+                                                             /\ pc' = [pc EXCEPT ![self] = "S240_5_seed_write_begin"]
+                                                             /\ UNCHANGED refused
+                                                        ELSE /\ refused' = [refused EXCEPT ![self] = "RESTART"]
+                                                             /\ pc' = [pc EXCEPT ![self] = "S240_5_close"]
+                                                             /\ fs' = fs
+                                           ELSE /\ pc' = [pc EXCEPT ![self] = "S240_5_seed_write_begin"]
+                                                /\ UNCHANGED << fs, refused >>
+                          /\ UNCHANGED << foreignObj, classified, ownerLive, 
+                                          sawLive, seenRec, crashed, live, 
+                                          holding, checked, writing, 
+                                          pendingUnlink, checkStale, 
+                                          writeStale, lostLock, 
+                                          landedAfterTakeover, published, 
+                                          verified, recoveredAfterCrash, 
+                                          tornRead, hostCrashChangedLock, 
+                                          touchedUncertain, refusedOk, stack, 
+                                          keep, obj_, got, obj, robj, victim, 
+                                          nobj, tobj, crashes, leases >>
 
 S240_5_seed_write_begin(self) == /\ pc[self] = "S240_5_seed_write_begin"
                                  /\ IF crashed[self]
@@ -2381,7 +2421,8 @@ TakeOver(self) == S240_5_s1(self) \/ S240_5_s2(self) \/ S240_5_s3(self)
                      \/ S240_5_s4(self) \/ S240_5_s5(self)
                      \/ S240_5_s6_seed(self) \/ S240_5_s6_write_begin(self)
                      \/ S240_5_s6_write_end(self) \/ S240_5_s6_flush(self)
-                     \/ S240_5_s6(self) \/ S240_5_seed_write_begin(self)
+                     \/ S240_5_s6(self) \/ S240_5_seed_lock(self)
+                     \/ S240_5_seed_write_begin(self)
                      \/ S240_5_seed_write_end(self)
                      \/ S240_5_seed_rename(self) \/ S240_5_close(self)
                      \/ takeover_crashed(self)
