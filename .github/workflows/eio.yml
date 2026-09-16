@@ -1,0 +1,38 @@
+name: EIO experiment
+
+# Does a lost lease fencing writes (Linux NFSv4) remove any of the accepted remote windows that the main
+# model measured without it? Same protocol as ckir/flux, one extra constant.
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  eio:
+    name: EIO (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [fenced, unfenced]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Run the experiment
+        run: python models/lockproto/run.py --expected models/lockproto/expected-eio.toml --scenario eio --platform ${{ matrix.platform }}
+      - name: Upload TLC output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tlc-output-eio-${{ matrix.platform }}
+          path: target/tla/out/
