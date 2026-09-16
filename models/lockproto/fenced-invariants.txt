@@ -1,0 +1,134 @@
+
+\* ------------------------------------------------------------------------------------------
+\* Properties (design Section 7).
+\*
+\* Safety invariants hold in every reachable state and are checked in the scenario's `check` run.
+\* Reachability is proved two ways: a step a label performs is proved by that label's TLC coverage
+\* count (design Section 4), and the two facts no single label states - a read that found a torn
+\* record, and a replaced lock that a crash had left - keep a ghost flag and are checked as witnesses
+\* in their own small run without `-continue`, which stops at the first violation and prints one
+\* trace. To get a trace for any other path, re-run the configuration with that witness as an
+\* invariant and no `-continue`.
+
+\* The filesystem model's own assumptions (FsModel.tla), so a simplification there cannot pass
+\* unnoticed.
+FsOk == FsInvariants(fs)
+
+\* Every object's content is one of the forms the protocol knows, so a classifier's judgement table
+\* covers every case it can meet (`Classifiable`, Section 7).
+Classifiable == \A o \in Objs : fs.content[o] = NoContent \/ fs.content[o] \in Contents
+
+\* For a target, at most one process is inside a publishing step whose last Section 99 check passed, or has
+\* a publishing write in flight. Tenure generations (owner ruling for plan 3, 2026-09-15): a new lock tenure -
+\* a create, a recovery or a takeover that stands - makes every other process's last check and issued write stale. As the spec stands, the one exception
+\* is a call already started before a later tenure began (240.5: "a filesystem call it had already started can
+\* still complete"). FIX_REMOTE_LEASE_SPEC models the amendments the open finding calls for: a process whose
+\* check passed in an earlier generation is no longer counted (the check-to-call window, however the lock was
+\* lost), and Section 99's check also tries the lock (Relock).
+Superseded(p) == IF FIX_REMOTE_LEASE_SPEC THEN checkStale[p] ELSE writing[p] /\ writeStale[p]
+SingleWriter == Cardinality({p \in Procs : (checked[p] \/ writing[p]) /\ ~Superseded(p)}) <= 1
+
+\* ------------------------------------------------------------------------------------------
+\* What the protocol is FOR (prototype, 2026-09-16). LockProtocol.tla cannot state these: it does not
+\* model the destination, so it defends SingleWriter, a proxy, and collects an accepted window every
+\* time the proxy breaks for a reason the spec tolerates.
+
+\* The destination always holds ONE operation's complete output. Never a mixture of two, never a file
+\* caught between the halves of a write, never an empty file: publication is a single rename of a
+\* file that was finished before it got the name.
+TargetComplete == TargetObj = NoObj \/ TargetContent \in Records
+
+\* An operation that re-checked its ownership after publishing, and still owned the lock, was not
+\* overwritten: what it reports as the destination's content is what the destination holds. An
+\* operation that lost the lock reports a refusal instead, so no one is told a lie.
+PublishedIsOwn == \A p \in Procs : verified[p] => TargetContent = OwnRecord(p)
+
+\* The witness that the prototype's runs reach a publication at all (otherwise the two above are vacuous).
+NeverPublished == \A p \in Procs : ~published[p]
+
+\* A process without `--break-lock` never removes, renames, or overwrites a lock it classified as
+\* uncertain, and creates a lock only at an empty lock path (Section 7).
+PlainNeverOwnsUncertain == ~touchedUncertain
+
+\* A `Foreign` object at a lock path is never written, renamed, or deleted (Section 7): the one an initial
+\* state holds is still the object at the lock path and still holds Foreign. A state predicate, so no
+\* misplaced ghost can make it vacuous.
+ForeignUntouched == foreignObj # NoObj => LockObj = foreignObj /\ fs.content[foreignObj] = Foreign
+
+\* A REGRESSION GUARD, not a liveness check. TARGET_LOCK_BUSY means the target's lock is held, not that
+\* its recorded owner is alive (240.2): a held OS-native lock cannot tell the owner from another
+\* invocation inspecting or recovering it, so no refusal-time check can establish owner liveness on
+\* that path. What this catches is a refusal with nothing behind it - a decision table that refuses
+\* BUSY for a lock it judged dead, or a Section 99 check (S99_check, S99_release_check, S21_1_s3) refusing with
+\* no cause: such a refusal is justified only by the ghost lostLock, set when another process's write, unlink,
+\* rename or replacement hit the lock file this process holds, or its lease lapsed (owner ruling for plan 3,
+\* 2026-09-15). The other refusing labels record the evidence of RefusalEvidence. The
+\* refusing label records its evidence because the refusal may be reported after what it saw has changed: the
+\* refusal rests on what the classifier observed, not on a re-read.
+RefusalJustified == \A p \in Procs : refused[p] = "TARGET_LOCK_BUSY" => refusedOk[p]
+
+\* The ghost witnesses, for the witness runs.
+NeverTornRead == ~tornRead
+\* A write issued in an earlier tenure generation landed after a later tenure began (240.5; remote scenarios).
+NeverInflightLandedAfterTakeover == ~landedAfterTakeover
+\* A process passed its Section 99 check, so SingleWriter's ghost is set (design Section 7).
+NeverChecked == \A p \in Procs : ~checked[p]
+NeverRecoveredAfterCrash == ~recoveredAfterCrash
+\* A host crash changed which object the lock path names: an unflushed create, move-aside or removal
+\* was undone. Label coverage cannot show this, because the host crash shares `env_loop` with the
+\* process crash (design Section 11).
+NeverHostCrashChangedLock == ~hostCrashChangedLock
+
+\* ------------------------------------------------------------------------------------------
+\* Temporal properties (design Section 7). A configuration that checks one lists exactly one
+\* PROPERTY, because TLC reports a temporal violation without naming the property it belongs to.
+
+\* Nothing more can go wrong: the environment has stopped, or has spent every crash and every lease
+\* expiry it has.
+EnvQuiet == pc["env"] \in {"env_done", "Done"} \/ (crashes = MaxCrashes /\ leases = MaxLeaseExpiries)
+
+\* Some actor entitled to replace a dead lock (240.3, 251.1) has not started yet and has not been
+\* killed, so it will still classify what is at the lock path. A PlainRun is not one: a plain rerun
+\* refuses a dead operation's lock with RESUMABLE_OPERATION_EXISTS (21.1).
+PendingMover == \E p \in Recoverers \cup Cleanups :
+                    /\ ~crashed[p]
+                    /\ pc[p] \in {"rec_start", "clean_start"}
+
+\* An actor reported that it could not establish the owner was dead. 240.4 preserves such a lock, so
+\* leaving it in place is the protocol working, not failing.
+UncertainReported == \E p \in Recoverers \cup Cleanups : refused[p] = "TARGET_LOCK_UNCERTAIN"
+
+\* A lock left behind by an owner that died does not stay there, PROVIDED someone is left to act on it
+\* and nothing more can go wrong: while no further crash can occur and an entitled actor has yet to
+\* run, the lock is eventually replaced or removed, or an actor reports it cannot tell the owner is
+\* dead (design Section 7). Without those conditions the property is false in every
+\* model whose actors all finish, because the last crash can always fall after the last actor has
+\* acted: measured, and that counterexample is why they are here.
+DeadLockEventuallyCleared ==
+    [](DeadOwnerLock /\ EnvQuiet /\ PendingMover => <>(~DeadOwnerLock \/ UncertainReported))
+
+\* The witness for that property's antecedent. Its run must stop with this violated, which is what
+\* stops the liveness run from passing over a state space that never reaches the case it is about.
+NeverDeadLockWithPendingMover == ~(DeadOwnerLock /\ EnvQuiet /\ PendingMover)
+
+\* A lock whose owner no reader can establish: the file at the lock path holds no readable record (torn,
+\* or created and not yet written). Only a --break-lock takeover clears one (240.4, 240.5).
+UncertainLock == LockObj # NoObj /\ fs.content[LockObj] \in {Torn, EmptyFile}
+
+\* A Breaker has not started yet and has not been killed, so it will still classify the lock.
+PendingBreaker == \E p \in Breakers : ~crashed[p] /\ pc[p] = "brk_start"
+
+\* A Breaker was refused because the lock was held (240.5 step 3 or later). RefusalJustified guards that
+\* the refusal had its evidence, so this outcome cannot hide a refusal with nothing behind it.
+BreakerReportedBusy == \E p \in Breakers : refused[p] = "TARGET_LOCK_BUSY"
+
+\* The same promise for an uncertain lock (design Section 7): while nothing more can go wrong and a
+\* Breaker has yet to run, an uncertain lock does not stay, or a Breaker was refused because something
+\* held it. Measured (plan 3): the last Breaker can meet a backing-off acquirer holding the torn lock for
+\* a few steps; the lock then stays until the next --break-lock, which the owner accepted.
+UncertainLockEventuallyCleared ==
+    [](UncertainLock /\ EnvQuiet /\ PendingBreaker => <>(~UncertainLock \/ BreakerReportedBusy))
+
+\* Its antecedent's witness, which keeps the liveness run from passing vacuously.
+NeverUncertainLockWithPendingBreaker == ~(UncertainLock /\ EnvQuiet /\ PendingBreaker)
+====

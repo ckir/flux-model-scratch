@@ -1,0 +1,74 @@
+---- MODULE Fenced ----
+\* PROTOTYPE (2026-09-16), not the V16 protocol: the fenced-publication variant, to be measured against
+\* LockProtocol.tla before any spec change. Three differences, all of them consequences of one idea - the
+\* lock is advisory and the last atomic operation is what decides the outcome:
+\*   1. ownership is the file a process holds open, tested by identity against the lock path, not the record
+\*      it reads back and not the OS-native lock;
+\*   2. a takeover creates a NEW file and renames it over the lock, so a prior owner's in-flight calls land
+\*      on a file no name reaches;
+\*   3. publication writes a private file and renames it over the destination in one step, and the operation
+\*      then re-checks its ownership before reporting success.
+\* The destination is modelled here, which LockProtocol.tla does not do, so the properties can say what the
+\* protocol is for: the destination always holds one operation's complete output, and an operation that
+\* verified its ownership after publishing was not overwritten.
+\* The V16 lock protocol: acquisition (96.1), classification and recovery (240.1 to 240.3), a takeover
+\* (240.5), a plain rerun's and a restart's decisions (21.1), cleanup (251.1), and commit-time revalidation (99), on the abstract
+\* filesystem of FsModel.tla. Design: docs/superpowers/specs/2026-09-11-lock-protocol-model-check-design.md,
+\* Sections 6.1, 7 and 12. Each label is named after the spec step it implements, and each performs
+\* at most one filesystem operation, so other actors run in between (design Section 5.2).
+EXTENDS Naturals, FiniteSets, Sequences, TLC
+
+CONSTANTS
+    Owners,        \* operations that acquire the lock and publish
+    Recoverers,    \* new invocations that recover a dead owner's lock (240.3)
+    PlainRuns,     \* new invocations with no flags (21.1)
+    Cleanups,      \* flux cleanup DEST (251.1)
+    Breakers,      \* flux copy --restart --break-lock (240.5, 21.1)
+    NoProc,        \* model value: nobody
+    P,             \* the target's parent directory
+    LockName,      \* P/<name>.flux-lock (96.1)
+    TargetName,    \* the destination itself, which this prototype models
+    DirLockName,   \* P/.flux-dir.lock, the long-name fallback (96.1); never created here
+    MaxObjs,       \* how many objects this scenario's actors can create (bounds the state space)
+    MaxCrashes,    \* how many crashes a run may have, both kinds together (design Section 5.2)
+    HostCrashes,   \* whether a host crash is one of the crashes this run explores
+    MaxLeaseExpiries, \* how many remote lock leases may lapse under a live holder (design Section 5.1)
+    Platform, IdentityStrength, LockCapability,
+    SEED_RECOVER_FOREIGN,    \* seeded defects (design Section 8); FALSE outside their seeded runs
+    SEED_RECOVER_UNCERTAIN,
+    SEED_DEAD_AS_BUSY,
+    SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK,
+    SEED_ACQUIRER_UNLINKS_BY_NAME,
+    SEED_RESTART_RELEASES,
+    SEED_MOVE_ASIDE_FOR_UNCERTAIN,
+    SEED_RENAME_OVER_TAKEOVER,
+    SEED_NO_CAPABILITY_GATE,
+    SEED_TORN_AS_FOREIGN,
+    FIX_REMOTE_LEASE_SPEC  \* fix flag of the open finding on SingleWriter: the remote-lease spec amendments (design Section 11)
+
+Procs == Owners \cup Recoverers \cup PlainRuns \cup Cleanups \cup Breakers
+\* <lock-name>.broken.<operation-id> beside the lock (240.3 step 2). Only an actor that can move a
+\* lock aside needs such a name, and every name is an entry class in every state, so the Owners do
+\* not get one. The target's own name is not here either: publishing sets a ghost in this scenario
+\* (the `nested` scenario, which is about what gets written where, creates the object).
+Movers == Recoverers \cup PlainRuns \cup Cleanups \cup Breakers
+BrokenOf(p) == <<"broken", p>>
+\* The private name SEED_RENAME_OVER_TAKEOVER's takeover builds its record under, before renaming it
+\* over the lock (design Section 8); only Breakers have one.
+TakeoverName(p) == <<"takeover", p>>
+\* The private file an operation writes its output into before renaming it over the destination.
+PubName(p) == <<"pub", p>>
+Names == {LockName, DirLockName, TargetName} \cup {BrokenOf(p) : p \in Movers}
+         \cup {TakeoverName(p) : p \in Procs} \cup {PubName(p) : p \in Procs}
+Dirs == {P}
+Fold == [n \in Names |-> n]          \* the recovery scenario needs no name folding
+
+INSTANCE FsModel WITH Dirs <- Dirs, Names <- Names, Procs <- Procs, NoProc <- NoProc,
+                      MaxObjs <- MaxObjs, Fold <- Fold, Platform <- Platform,
+                      IdentityStrength <- IdentityStrength, LockCapability <- LockCapability
+
+\* How a classifier judged the lock path (design Section 6.1).
+RecovererPerms == Permutations(Recoverers)
+BreakerPerms == Permutations(Breakers)
+Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "dead"}
+

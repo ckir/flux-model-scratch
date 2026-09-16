@@ -1,0 +1,42 @@
+# The fenced prototype's runs (2026-09-16). Not part of the gate: run it with
+#   python models/lockproto/run.py --expected models/lockproto/expected-fenced.toml --scenario fenced --platform posix
+# or through the Model (fenced prototype) workflow. Measured against the same setting LockProtocol.tla needs
+# three accepted windows for.
+
+scenarios = ["fenced"]
+
+[[run]]
+name = "fenced-posix-check"
+module = "Fenced"
+config = "configs/fenced-posix-check.cfg"
+scenario = "fenced"
+kind = "check"
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
+unreached = [
+    { label = "S240_5_s6_write_begin", reason = "the takeover always builds a new file and renames it over the lock in this prototype, so the in-place write and the identity re-check after it are gone" },
+    { label = "S240_5_s6_write_end", reason = "the takeover always builds a new file and renames it over the lock in this prototype, so the in-place write and the identity re-check after it are gone" },
+    { label = "S240_5_s6_flush", reason = "the takeover always builds a new file and renames it over the lock in this prototype, so the in-place write and the identity re-check after it are gone" },
+    { label = "S240_5_s6", reason = "the takeover always builds a new file and renames it over the lock in this prototype, so the in-place write and the identity re-check after it are gone" },
+    { label = "S96_1_backoff", reason = "the 96.1 directory-lock conflict: this scenario has no directory lock" },
+]
+timeout_minutes = 60
+
+[[run]]
+name = "fenced-posix-witness-NeverPublished"
+module = "Fenced"
+config = "configs/fenced-posix-witness-NeverPublished.cfg"
+scenario = "fenced"
+kind = "witness"
+violated = ["NeverPublished"]
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
+timeout_minutes = 30
+
+[[run]]
+name = "fenced-posix-witness-SingleWriter"
+module = "Fenced"
+config = "configs/fenced-posix-singlewriter.cfg"
+scenario = "fenced"
+kind = "witness"
+violated = ["SingleWriter"]
+constants = { Owners = ["o1"], Recoverers = [], PlainRuns = [], Cleanups = [], Breakers = ["b1"], MaxObjs = 5, MaxCrashes = 1, HostCrashes = false, MaxLeaseExpiries = 1, Platform = "posix", IdentityStrength = "strong", LockCapability = "remote", SEED_RECOVER_FOREIGN = false, SEED_RECOVER_UNCERTAIN = false, SEED_DEAD_AS_BUSY = false, SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK = false, SEED_ACQUIRER_UNLINKS_BY_NAME = false, SEED_RESTART_RELEASES = false, SEED_MOVE_ASIDE_FOR_UNCERTAIN = false, SEED_RENAME_OVER_TAKEOVER = false, SEED_NO_CAPABILITY_GATE = false, SEED_TORN_AS_FOREIGN = false }
+timeout_minutes = 30

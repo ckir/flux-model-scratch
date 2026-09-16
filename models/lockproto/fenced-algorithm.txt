@@ -1,0 +1,1071 @@
+(* --algorithm Fenced {
+     \* Fairness (design Section 7): every actor is a weakly fair process, so an actor that can keep taking a
+     \* step eventually takes it, however busy the others are; the environment is not fair, so whether and
+     \* when it crashes something stays a free choice. Weak fairness of the whole system alone let one actor
+     \* spin in a retry loop while another that could step never did (plan 3, breaklock liveness).
+     \* Each label performs at most ONE filesystem operation (design Section 5.2). A purely local
+     \* decision that follows a call - a judgement over what was just read, a branch on whether the
+     \* call succeeded - belongs to the same label: no other actor can observe the state between
+     \* them, so giving it a label of its own would only add interleavings (Lipton reduction).
+     \*
+     \* Every label of every actor begins by checking whether this process has crashed. A crash is
+     \* performed by the `env` process below, which releases the handles and OS-native locks of the
+     \* process it kills (Section 5.2); the process itself then performs nothing further and ends at
+     \* Done, which is what keeps TLC's deadlock check meaningful.
+     variables
+       \* The filesystem (FsModel.tla). A run starts from an empty lock path, or from one holding an object
+       \* that is not a Flux lock record, which no actor ever writes (design Section 7, ForeignUntouched).
+       fs \in {FsInit, FsWith(P, LockName, Foreign)},
+       foreignObj = At(fs, P, LockName),         \* ghost: that Foreign object, or NoObj
+       classified = [p \in Procs |-> "none"],     \* ghost: each process's last judgement
+       ownerLive = [p \in Procs |-> "none"],      \* what it decided about the record's owner
+       sawLive = [p \in Procs |-> FALSE],         \* its classification found a live owner
+       seenRec = [p \in Procs |-> EmptyFile],     \* ghost: what this process last read at the lock path
+       crashed = [p \in Procs |-> FALSE],         \* ghost: this process died
+       live = [p \in Procs |-> FALSE],            \* it has started and has neither finished nor died
+       holding = [p \in Procs |-> FALSE],         \* this process owns the target lock now
+       checked = [p \in Procs |-> FALSE],         \* its last Section 99 check passed
+       writing = [p \in Procs |-> FALSE],         \* its publishing write is issued and has not landed (Section 5.2)
+       pendingUnlink = [p \in Procs |-> NoObj],   \* the lock file its issued release unlink resolved, not yet landed
+       checkStale = [p \in Procs |-> TRUE],       \* a lock tenure began after its last passing Section 99 check
+       writeStale = [p \in Procs |-> TRUE],       \* a lock tenure began after it issued its publishing write
+       lostLock = [p \in Procs |-> FALSE],        \* ghost: another process's write, unlink, rename or a lease lapse hit its lock file
+       landedAfterTakeover = FALSE,               \* witness: a write issued in an earlier generation landed
+       published = [p \in Procs |-> FALSE],       \* ghost: its output is at the destination, or was
+       verified = [p \in Procs |-> FALSE],        \* ghost: after publishing, it re-checked and still owned the lock
+       recoveredAfterCrash = FALSE,               \* witness: a lock left by a crash was replaced
+       tornRead = FALSE,                          \* witness: a process read a torn record
+       hostCrashChangedLock = FALSE,              \* witness: a host crash changed what is at the lock path
+       touchedUncertain = FALSE,                  \* a lock judged uncertain was mutated
+       refusedOk = [p \in Procs |-> FALSE],       \* the refusal below was justified
+       refused = [p \in Procs |-> "none"];        \* what a refusing actor reported
+
+     define {
+       LockObj == At(fs, P, LockName)
+       \* `f` after process q's issued release unlink lands. NFS REMOVE carries the directory handle and the NAME
+       \* (RFC 7530), and the server resolves that name when it executes the call, so a stale unlink removes
+       \* whatever holds the name THEN - including a lock another operation created meanwhile. The optimistic
+       \* reading, where the call resolves the path when it is issued, is what LockProtocol.tla assumes.
+       LandUnlink(f, q, c) == IF q # NoProc /\ pendingUnlink[q] # NoObj /\ At(f, P, LockName) # NoObj
+                              THEN FsUnlink(f, P, LockName, c).fs ELSE f
+       OwnRecord(p) == Rec(p, IF p \in Cleanups THEN "cleanup" ELSE "operation")
+       \* The object of the one lock-file handle a process holds, or NoObj. A holder of the target lock
+       \* has exactly one open handle at the points that use this (after a takeover or a recovery).
+       HandleObj(p) == IF \E h \in fs.handles : h.proc = p
+                       THEN (CHOOSE h \in fs.handles : h.proc = p).obj
+                       ELSE NoObj
+       \* Ownership in this prototype: the lock path still names the very file this process holds open. No record
+       \* comparison (a record is descriptive, 99.1) and no OS-native lock (a lease can lapse unheard), so nothing
+       \* here depends on a value another process can forge or on a lock this process cannot query.
+       StillOwned(p) == LockObj # NoObj /\ HandleObj(p) = LockObj
+       \* Linux NFSv4 (since 3.12) does not reclaim a lock lost to an expired lease, and read/write through that
+       \* descriptor then fail with EIO until it is closed (fcntl_locking(2); the module parameter
+       \* recover_lost_locks, which re-enables reclaim, is documented as risking corruption). So a write through
+       \* a descriptor whose lock this process no longer holds FAILS here, rather than silently landing. It says
+       \* nothing about a rename, which is a directory operation and is not fenced this way.
+       WriteFenced(p, o) == LockCapability = "remote" /\ o # NoObj /\ fs.oslock[o] # p
+       \* The destination, and what it holds.
+       TargetObj == At(fs, P, TargetName)
+       TargetContent == IF TargetObj = NoObj THEN NoContent ELSE fs.content[TargetObj]
+       \* The lock path holds a record whose owner is alive: what justifies TARGET_LOCK_BUSY
+       \* (Section 7, 240.2). A takeover's record is the `breaklock` scenario's business.
+       BusyJustified == /\ LockObj # NoObj
+                        /\ IsRecord(fs.content[LockObj])
+                        /\ ~crashed[fs.content[LockObj].op]
+       \* The destination provides OS-native locks (235.1): every lock attempt is conditional on it, as
+       \* 96.1 and 240.3 step 4 put it. Under `weak` 235.1 refuses first, so only SEED_NO_CAPABILITY_GATE
+       \* ever runs a protocol step without them.
+       LocksAvailable == LockCapability # "weak"
+       \* The evidence a TARGET_LOCK_BUSY refusal rests on, recorded by every refusing label through this
+       \* one definition, so SEED_DEAD_AS_BUSY guards all of them (design Section 7, RefusalJustified).
+       \* 240.2 defines TARGET_LOCK_BUSY as "the lock is held", so another process holding the OS-native lock
+       \* on the file at the lock path is evidence too (owner ruling for plan 3: a takeover writing in place
+       \* holds it while the record it replaces is torn).
+       HeldByOther(p) == LockObj # NoObj /\ fs.oslock[LockObj] \notin {NoProc, p}
+       RefusalEvidence(p) == BusyJustified \/ sawLive[p] \/ HeldByOther(p)
+       \* Process q holds an open handle on object o.
+       Holds(q, o) == o # NoObj /\ \E h \in fs.handles : h.proc = q /\ h.obj = o
+       \* The cause ghost after process `me` writes, unlinks, renames or replaces object o: every other process with
+       \* a handle on it has had its lock hit. A failed Section 99 check is justified only by that cause (owner ruling
+       \* for plan 3, 2026-09-15): a restatement of the check's own predicate could not catch a wrong refusal.
+       MarkLost(me, o) == [q \in Procs |-> IF q # me /\ Holds(q, o) THEN TRUE ELSE lostLock[q]]
+       \* The actor's judgement was uncertain: a torn or empty record, or an owner the oracle cannot judge.
+       JudgedUncertain(p) == classified[p] = "uncertain" \/ ownerLive[p] = "uncertain"
+       \* A lock this actor may replace through 240.3: a dead owner's operation lock, or a cleanup
+       \* lock whose owner is dead (251.1, 259.6). The seeds re-introduce the defects of design Section 8.
+       Replaceable(p) == \/ classified[p] = "dead"
+                         \/ (classified[p] = "cleanuplock" /\ ownerLive[p] = "dead")
+                         \/ (SEED_RECOVER_UNCERTAIN /\ classified[p] = "uncertain" /\ ownerLive[p] = "none")
+                         \/ (SEED_RECOVER_FOREIGN /\ classified[p] = "foreign")
+                         \/ (SEED_RECOVER_UNCERTAIN_CLEANUP_LOCK /\ classified[p] = "cleanuplock"
+                                                                /\ ownerLive[p] = "uncertain")
+       \* The states the liveness properties are about, and the two state witnesses (Section 7).
+       DeadOwnerLock == /\ LockObj # NoObj
+                        /\ IsRecord(fs.content[LockObj])
+                        /\ crashed[fs.content[LockObj].op]
+       TornLock == LockObj # NoObj /\ fs.content[LockObj] = Torn
+     }
+
+     \* Classify what is at the lock path: open it, try its OS-native lock without waiting, read the
+     \* record, then judge (design Section 6.1). `keep` says whether the caller keeps the handle and
+     \* the lock it may have taken, as 240.3 does through its move-aside.
+     procedure Classify(keep)
+       variables obj = 0, got = FALSE;
+     {
+       S240_1_open:
+         if (crashed[self]) { goto classify_crashed; }
+         else {
+           \* No entry at the lock path: the open fails and the judgement is "empty" (96.1).
+           with (r = FsOpen(fs, P, LockName, self, TRUE)) {
+             if (r.ok) { fs := r.fs; obj := r.val; }
+             else { classified[self] := "empty"; seenRec[self] := EmptyFile; return; };
+         };
+         };
+       S240_1_trylock:
+         if (crashed[self]) { goto classify_crashed; }
+         else {
+           with (r = FsTryLock(fs, self, obj)) {
+             got := r.ok;
+             if (r.ok) { fs := r.fs; };
+         };
+         };
+       S240_1_read:
+         if (crashed[self]) { goto classify_crashed; }
+         else {
+           \* Read the record, then judge what was read (Section 6.1's table). A torn or unreadable
+           \* record cannot show a dead owner: uncertain (96.1, 240.4, 259.6).
+           with (seen = fs.content[obj]) {
+             seenRec[self] := seen;
+             if (seen = Torn) { tornRead := TRUE; };
+             if ((seen = Torn /\ ~SEED_TORN_AS_FOREIGN) \/ seen = EmptyFile) {
+               classified[self] := "uncertain";
+               ownerLive[self] := "none";
+               sawLive[self] := FALSE;
+             } else if (seen = Foreign \/ (SEED_TORN_AS_FOREIGN /\ seen = Torn)) {
+               \* SEED_TORN_AS_FOREIGN (design Section 8) treats a checksum-failing record as a foreign object.
+               classified[self] := "foreign";
+               ownerLive[self] := "none";
+               sawLive[self] := FALSE;
+             } else {
+               \* The OS-native lock proves the owner is alive (240.2); otherwise the oracle decides
+               \* what no filesystem fact can (Section 6.1), consistent with the truth and free to say
+               \* "uncertain" either way.
+               with (alive \in IF ~got /\ LockCapability \in {"strong", "remote"} THEN {"live"}
+                              ELSE IF crashed[seen.op] THEN {"dead", "uncertain"}
+                              ELSE {"live", "uncertain"}) {
+                 ownerLive[self] := alive;
+                 \* A "live" forced by a failed try-lock shows the lock is held, which is what BUSY means
+                 \* (240.2); it does not show who holds it.
+                 sawLive[self] := alive = "live";
+                 \* A cleanup lock is its own case (251.1); an operation's lock takes its judgement
+                 \* from its owner (240.1 to 240.4).
+                 if (seen.kind = "cleanup") { classified[self] := "cleanuplock"; }
+                 else { classified[self] := alive; };
+         };
+             };
+           };
+         };
+       S240_1_close:
+         \* Unless the caller keeps the handle through its next steps, the classifier closes it at
+         \* once, which also gives back the OS-native lock (Section 5.1), so a refusal never leaves a
+         \* lock held on another process's file (Section 6.1).
+         if (crashed[self]) { goto classify_crashed; }
+         else {
+           if (~keep \/ ~Replaceable(self)) { fs := FsClose(fs, self, obj).fs; };
+           return;
+         };
+       classify_crashed:
+         return;
+     }
+
+     \* Acquire the target lock (96.1): create it exclusively, check the directory lock is absent,
+     \* take its OS-native lock, then write this operation's record.
+     procedure Acquire()
+       variables obj = 0;
+     {
+       S96_1_create:
+         if (crashed[self]) { goto acquire_crashed; }
+         else {
+           \* Another operation created the lock first: start the acquisition again (21.1 step 1).
+           with (r = FsCreate(fs, P, LockName, self, TRUE)) {
+             if (r.ok) { fs := r.fs; obj := r.val; lostLock[self] := FALSE; }
+             else { refused[self] := "RESTART"; return; };
+         };
+         };
+       S96_1_dircheck:
+         \* The per-name acquirer announces, then checks (96.1). The directory lock never exists in
+         \* this scenario, so the conflict below is the `dirlock` scenario's business.
+         if (crashed[self]) { goto acquire_crashed; }
+         else {
+           if (FsLookup(fs, P, DirLockName)) { goto S96_1_backoff; };
+         };
+       S96_1_ownlock:
+         \* A classifier can open the file just created and take its lock before this step does.
+         if (crashed[self]) { goto acquire_crashed; }
+         else {
+           if (LocksAvailable) {
+             with (r = FsTryLock(fs, self, obj)) {
+               if (r.ok) { fs := r.fs; }
+               else { goto S96_1_ownlock_wait; };
+             };
+         };
+         };
+       S96_1_ownlock_verify:
+         \* Holding the lock, check that the lock path still names the file and that nobody has written it
+         \* (a takeover that finished and released while this acquirer waited): otherwise start again.
+         if (crashed[self]) { goto acquire_crashed; }
+         else {
+           with (ident \in FsIdentityChoices(fs, P, LockName)) {
+             if (ident # obj \/ fs.content[obj] # EmptyFile) { goto S96_1_ownlock_close; };
+         };
+         };
+       S96_1_record_begin:
+         if (crashed[self]) { goto acquire_crashed; }
+         else {
+           \* The lease lapsed under this write: the descriptor is poisoned and the write fails (EIO).
+           if (WriteFenced(self, obj)) {
+             refused[self] := "TARGET_LOCK_BUSY";
+             refusedOk[self] := lostLock[self];
+             holding[self] := FALSE;
+             goto S96_1_ownlock_close;
+           }
+           else {
+             fs := FsWriteBegin(fs, obj).fs;
+             lostLock := MarkLost(self, obj);
+           };
+         };
+       S96_1_record_end:
+         \* A crash between the two halves of the write leaves the record torn (Section 5.2), which
+         \* is what the `NeverTornRead` witness run is about.
+         if (crashed[self]) { goto acquire_crashed; }
+         else {
+           \* The lease lapsed under this write: the descriptor is poisoned and the write fails (EIO).
+           if (WriteFenced(self, obj)) {
+             refused[self] := "TARGET_LOCK_BUSY";
+             refusedOk[self] := lostLock[self];
+             holding[self] := FALSE;
+             goto S96_1_ownlock_close;
+           }
+           else {
+             fs := FsWriteEnd(fs, obj, OwnRecord(self)).fs;
+             \* Either half of a write can hit a file another process took meanwhile, so both mark it.
+             lostLock := MarkLost(self, obj);
+             seenRec[self] := OwnRecord(self);
+             holding[self] := TRUE;
+             \* A new tenure: every other process's last check and issued write are stale from here (design Section 7).
+             checkStale := [q \in Procs |-> IF q = self THEN checkStale[q] ELSE TRUE];
+             writeStale := [q \in Procs |-> IF q = self THEN writeStale[q] ELSE TRUE];
+             return;
+           };
+         };
+       S96_1_backoff:
+         \* On a conflict the acquirer removes what it created and reports TARGET_LOCK_BUSY (96.1).
+         if (crashed[self]) { goto acquire_crashed; }
+         else {
+           refusedOk[self] := RefusalEvidence(self);
+           with (c \in FsUnlinkChoices) { fs := FsUnlink(fs, P, LockName, c).fs; };
+           lostLock := MarkLost(self, LockObj);
+           refused[self] := "TARGET_LOCK_BUSY";
+           return;
+         };
+       S96_1_ownlock_wait:
+         \* Without the OS-native lock the record would prove nothing, and 240.2 would read whoever does
+         \* hold the lock as the owner (96.1). The holder may be an inspector, which lets go, or a takeover of
+         \* this very file (240.5). While the lock path still names the file and it is still empty, try the
+         \* lock again or give up; once it has changed, give up. Giving up closes the handle and never removes
+         \* the file by name, which could delete a takeover's lock (plan 3's measured finding): the empty lock
+         \* it leaves is uncertain, and --break-lock clears it.
+         if (crashed[self]) { goto acquire_crashed; }
+         else {
+           with (ident \in FsIdentityChoices(fs, P, LockName)) {
+             if (ident # obj \/ fs.content[obj] # EmptyFile) { goto S96_1_ownlock_close; }
+             else {
+               either { goto S96_1_ownlock; }
+               or { goto S96_1_ownlock_close; };
+             };
+         };
+         };
+       S96_1_ownlock_close:
+         \* SEED_ACQUIRER_UNLINKS_BY_NAME puts back the old wording, which removed the file by name first.
+         if (crashed[self]) { goto acquire_crashed; }
+         else {
+           with (c \in FsUnlinkChoices) {
+             fs := FsClose(IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN FsUnlink(fs, P, LockName, c).fs ELSE fs, self, obj).fs;
+           };
+           lostLock := IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN MarkLost(self, LockObj) ELSE lostLock;
+           refused[self] := "RESTART";
+           return;
+         };
+       acquire_crashed:
+         return;
+     }
+
+     \* Replace a dead owner's lock by moving it aside (240.3 steps 1 to 5). The caller has
+     \* classified the lock as replaceable and still holds its handle and its OS-native lock.
+     procedure Recover()
+       variables robj = 0, victim = NoProc, nobj = 0;
+     {
+       S240_3_s1:
+         \* Re-read the lock: proceed only if it still names the same dead owner.
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           robj := LockObj;
+           if (IsRecord(seenRec[self])) { victim := seenRec[self].op; };
+           if (LockObj = NoObj \/ fs.content[LockObj] # seenRec[self]) { goto S240_3_restart; };
+         };
+       S240_3_s2:
+         \* Only one of several concurrent recoverers can move it; the others find the lock gone and
+         \* start the acquisition again (240.3 step 2).
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           if (JudgedUncertain(self)) { touchedUncertain := TRUE; };
+           with (r = FsRenameNoReplace(fs, P, LockName, BrokenOf(self))) {
+             if (r.ok) { fs := r.fs; lostLock := MarkLost(self, LockObj); } else { goto S240_3_restart; };
+         };
+         };
+       S240_3_s3:
+         \* Check the moved file is the one step 1 re-read, by identity AND by its record: a takeover
+         \* rewrites the record in the same file, so identity alone is not enough (240.3 step 3).
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           with (ident \in FsIdentityChoices(fs, P, BrokenOf(self))) {
+             if (ident # robj \/ fs.content[robj] # seenRec[self]) { goto S240_3_putback; };
+         };
+         };
+       S240_3_s4:
+         \* Create its own lock exclusively (step 4). If that fails, another operation owns the
+         \* target: delete the moved file, whose owner is dead, and start again.
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           with (r = FsCreate(fs, P, LockName, self, TRUE)) {
+             if (r.ok) { fs := r.fs; nobj := r.val; lostLock[self] := FALSE; } else { goto S240_3_s4_drop; };
+         };
+         };
+       S240_3_s4_lock:
+         \* The lock, and the record write below, go through the handle the create returned, as the
+         \* acquirer's do (a reading, recorded in trace.toml): never through a second lookup of the path.
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           if (LocksAvailable) {
+             with (r = FsTryLock(fs, self, nobj)) {
+               if (r.ok) { fs := r.fs; }
+               else { goto S240_3_s4_lock_wait; };
+             };
+         };
+         };
+       S240_3_s4_lock_verify:
+         \* As 96.1's acquirer: holding the lock, the path must still name the new file and it must still
+         \* be empty, or the recoverer closes it and drops the moved file.
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           with (ident \in FsIdentityChoices(fs, P, LockName)) {
+             if (ident # nobj \/ fs.content[nobj] # EmptyFile) { goto S240_3_s4_lock_close; };
+         };
+         };
+       S240_3_s4_record_begin:
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           fs := FsWriteBegin(fs, nobj).fs;
+           lostLock := MarkLost(self, nobj);
+         };
+       S240_3_s4_record_end:
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           fs := FsWriteEnd(fs, nobj, OwnRecord(self)).fs;
+           lostLock := MarkLost(self, nobj);
+           seenRec[self] := OwnRecord(self);
+           holding[self] := TRUE;
+           \* A new tenure: every other process's last check and issued write are stale from here (design Section 7).
+           checkStale := [q \in Procs |-> IF q = self THEN checkStale[q] ELSE TRUE];
+           writeStale := [q \in Procs |-> IF q = self THEN writeStale[q] ELSE TRUE];
+         };
+       S240_3_s5:
+         \* Delete the moved file (step 5).
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           with (c \in FsUnlinkChoices) { fs := FsUnlink(fs, P, BrokenOf(self), c).fs; };
+           if (victim \in Procs) { if (crashed[victim]) { recoveredAfterCrash := TRUE; }; };
+           goto S240_3_release;
+         };
+       S240_3_s4_drop:
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           with (c \in FsUnlinkChoices) { fs := FsUnlink(fs, P, BrokenOf(self), c).fs; };
+           refused[self] := "RESTART";
+           goto S240_3_release;
+         };
+       S240_3_s4_lock_wait:
+         \* The same rule at 240.3 step 4 (96.1): while the path still names the new file and it is still
+         \* empty, try the lock again or give up; giving up closes without removing the file by name, then
+         \* drops the moved file as a failed create does, and starts again.
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           with (ident \in FsIdentityChoices(fs, P, LockName)) {
+             if (ident # nobj \/ fs.content[nobj] # EmptyFile) { goto S240_3_s4_lock_close; }
+             else {
+               either { goto S240_3_s4_lock; }
+               or { goto S240_3_s4_lock_close; };
+             };
+         };
+         };
+       S240_3_s4_lock_close:
+         \* SEED_ACQUIRER_UNLINKS_BY_NAME puts back the old wording, which removed the file by name first.
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           with (c \in FsUnlinkChoices) {
+             fs := FsClose(IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN FsUnlink(fs, P, LockName, c).fs ELSE fs, self, nobj).fs;
+           };
+           lostLock := IF SEED_ACQUIRER_UNLINKS_BY_NAME THEN MarkLost(self, LockObj) ELSE lostLock;
+           goto S240_3_s4_drop;
+         };
+       S240_3_putback:
+         \* Rename the file back without replacing, then start the acquisition again (step 3).
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           with (r = FsRenameNoReplace(fs, P, BrokenOf(self), LockName)) {
+             if (r.ok) { fs := r.fs; };
+           };
+           refused[self] := "RESTART";
+           goto S240_3_release;
+         };
+       S240_3_restart:
+         \* Start the acquisition again (21.1 step 1). This model stops here instead of looping: one
+         \* pass reaches every state a further one would, and the bound is in the README.
+         refused[self] := "RESTART";
+       S240_3_release:
+         if (crashed[self]) { goto recover_crashed; }
+         else {
+           if (robj # NoObj /\ OpenBy(fs, self, robj)) { fs := FsClose(fs, self, robj).fs; };
+           return;
+         };
+       recover_crashed:
+         return;
+     }
+
+     \* Take an uncertain lock over in place (240.5 steps 1 to 6), so the lock path is never empty. The
+     \* caller classified the lock as uncertain and closed that handle; `seenRec` holds the record it
+     \* reported as the holder. A takeover that succeeds returns holding the lock file's handle and its
+     \* OS-native lock; every other outcome returns holding nothing.
+     procedure TakeOver()
+       variables tobj = 0;
+     {
+       S240_5_s1:
+         \* Strong file identity and OS-native locks, decided from the capability, never by a trial lock.
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           if (IdentityStrength # "strong" \/ (LockCapability \notin {"strong", "remote"} /\ ~SEED_NO_CAPABILITY_GATE)) {
+             refused[self] := "TARGET_LOCK_UNCERTAIN";
+             return;
+           };
+         };
+       S240_5_s2:
+         \* Open the existing lock file for writing, without creating it; if it is gone, start again.
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           with (r = FsOpen(fs, P, LockName, self, TRUE)) {
+             if (r.ok) { fs := r.fs; tobj := r.val; lostLock[self] := FALSE; }
+             else { refused[self] := "RESTART"; return; };
+         };
+         };
+       S240_5_s3:
+         \* Its OS-native lock without waiting. A failure means another process holds it (the owner, or
+         \* another takeover), and that failure is the refusal's evidence (240.2).
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           if (LocksAvailable) {
+             with (r = FsTryLock(fs, self, tobj)) {
+               if (r.ok) { fs := r.fs; }
+               else {
+                 refusedOk[self] := fs.oslock[tobj] # NoProc \/ RefusalEvidence(self);
+                 refused[self] := "TARGET_LOCK_BUSY";
+                 goto S240_5_close;
+               };
+             };
+         };
+         };
+       S240_5_s4:
+         \* The open file must still be the one at the lock path.
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           with (ident \in FsIdentityChoices(fs, P, LockName)) {
+             if (ident # tobj) { refused[self] := "RESTART"; goto S240_5_close; };
+         };
+         };
+       S240_5_s5:
+         \* Read the record. A live owner refuses; another operation than the reported holder starts
+         \* again; the reported holder, or an unreadable record, continues. Whether a named owner is
+         \* alive is the oracle's judgement, as in classification (design Section 6.1).
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           with (seen = fs.content[tobj]) {
+             if (IsRecord(seen) /\ seen # seenRec[self]) { refused[self] := "RESTART"; goto S240_5_close; }
+             else if (IsRecord(seen)) {
+               with (alive \in IF crashed[seen.op] THEN {"dead", "uncertain"} ELSE {"live", "uncertain"}) {
+                 if (alive = "live") {
+                   sawLive[self] := TRUE;
+                   \* A define-block operator reads the variables as they were before this step, so RefusalEvidence
+                   \* would not see the sawLive set just above; the judgement is passed in directly. Measured under
+                   \* remote (2026-09-15): the prior owner's release unlink empties the path during the takeover, so
+                   \* BusyJustified is false and only this judgement is behind the refusal.
+                   refusedOk[self] := alive = "live" \/ RefusalEvidence(self);
+                   refused[self] := "TARGET_LOCK_BUSY";
+                   goto S240_5_close;
+                 };
+             };
+             };
+         };
+         };
+       S240_5_s6_seed:
+         \* SEED_RENAME_OVER_TAKEOVER (design Section 8): instead of overwriting in place, build this
+         \* operation's record under a private name and rename it over the lock.
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           \* Always, in this prototype: the takeover's record goes into a NEW file, which is renamed over the
+           \* lock. The prior owner keeps its handle on the old file, and every call it has in flight lands
+           \* there - on a file no name reaches any more.
+           with (r = FsCreate(fs, P, TakeoverName(self), self, TRUE)) {
+             if (r.ok) { fs := r.fs; goto S240_5_seed_write_begin; }
+             else { refused[self] := "RESTART"; goto S240_5_close; };
+           };
+         };
+       S240_5_s6_write_begin:
+         \* Overwrite the record in place with this operation's record, in one write (259.6).
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           fs := FsWriteBegin(fs, tobj).fs;
+           lostLock := MarkLost(self, tobj);
+         };
+       S240_5_s6_write_end:
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           fs := FsWriteEnd(fs, tobj, OwnRecord(self)).fs;
+           lostLock := MarkLost(self, tobj);
+           seenRec[self] := OwnRecord(self);
+         };
+       S240_5_s6_flush:
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           fs := FsFlushFile(fs, tobj).fs;
+         };
+       S240_5_s6:
+         \* Check the file identity against the lock path again. Empty: the prior owner removed its lock
+         \* meanwhile, so start again. Another file: whoever created it owns the target. The same file: the
+         \* takeover stands, and this operation proceeds as if the prior owner were dead.
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           with (ident \in FsIdentityChoices(fs, P, LockName)) {
+             if (ident = NoObj) { refused[self] := "RESTART"; goto S240_5_close; }
+             else if (ident # tobj) {
+               refusedOk[self] := LockObj # NoObj /\ LockObj # tobj;
+               refused[self] := "TARGET_LOCK_BUSY";
+               goto S240_5_close;
+             }
+             else {
+               \* The takeover stands: it ends the prior owner's tenure (design Section 7).
+               holding[self] := TRUE;
+               checkStale := [q \in Procs |-> IF q = self THEN checkStale[q] ELSE TRUE];
+               writeStale := [q \in Procs |-> IF q = self THEN writeStale[q] ELSE TRUE];
+               return;
+             };
+         };
+         };
+       S240_5_seed_write_begin:
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           fs := FsWriteBegin(fs, At(fs, P, TakeoverName(self))).fs;
+           lostLock := MarkLost(self, At(fs, P, TakeoverName(self)));
+         };
+       S240_5_seed_write_end:
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           fs := FsWriteEnd(fs, At(fs, P, TakeoverName(self)), OwnRecord(self)).fs;
+           lostLock := MarkLost(self, At(fs, P, TakeoverName(self)));
+           seenRec[self] := OwnRecord(self);
+         };
+       S240_5_seed_rename:
+         \* The rename replaces the lock; the old file keeps its handles and its OS-native lock.
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           with (r = FsRenameReplace(fs, P, TakeoverName(self), LockName)) {
+             if (r.ok) {
+               fs := FsClose(r.fs, self, tobj).fs;
+               lostLock := MarkLost(self, LockObj);
+               holding[self] := TRUE;
+               checkStale := [q \in Procs |-> IF q = self THEN checkStale[q] ELSE TRUE];
+               writeStale := [q \in Procs |-> IF q = self THEN writeStale[q] ELSE TRUE];
+               return;
+             }
+             else { refused[self] := "RESTART"; goto S240_5_close; };
+           };
+         };
+       S240_5_close:
+         if (crashed[self]) { goto takeover_crashed; }
+         else {
+           if (tobj # NoObj /\ OpenBy(fs, self, tobj)) { fs := FsClose(fs, self, tobj).fs; };
+           return;
+         };
+       takeover_crashed:
+         return;
+     }
+
+     \* Publish under the lock, revalidating before the write (Section 99), then release it.
+     procedure Publish()
+     {
+       S99_check:
+         \* "Still owned" is a read of the lock path; the decision that follows is local.
+         if (crashed[self]) { goto publish_crashed; }
+         else {
+           if (StillOwned(self)) { checked[self] := TRUE; checkStale[self] := FALSE; }
+           else {
+             checked[self] := FALSE;
+             refusedOk[self] := lostLock[self];
+             refused[self] := "TARGET_LOCK_BUSY";
+             holding[self] := FALSE;
+             goto S99_refuse_close;
+         };
+         };
+       S99_pub_create:
+         \* Write the output into a private file first. Nothing here is visible at the destination yet.
+         if (crashed[self]) { goto publish_crashed; }
+         else {
+           with (r = FsCreate(fs, P, PubName(self), self, TRUE)) {
+             if (r.ok) { fs := r.fs; } else { refused[self] := "RESTART"; goto S99_refuse_close; };
+           };
+         };
+       S99_pub_write_begin:
+         if (crashed[self]) { goto publish_crashed; }
+         else {
+           fs := FsWriteBegin(fs, At(fs, P, PubName(self))).fs;
+         };
+       S99_pub_write_end:
+         if (crashed[self]) { goto publish_crashed; }
+         else {
+           fs := FsWriteEnd(fs, At(fs, P, PubName(self)), OwnRecord(self)).fs;
+         };
+       S99_pub_rename:
+         \* The publication itself: one atomic rename over the destination. A loser's rename lands whole, so the
+         \* destination always holds one operation's complete output - never a mixture, never a torn file.
+         if (crashed[self]) { goto publish_crashed; }
+         else {
+           with (r = FsRenameReplace(fs, P, PubName(self), TargetName)) {
+             if (r.ok) { fs := r.fs; published[self] := TRUE; }
+             else { refused[self] := "RESTART"; goto S99_refuse_close; };
+           };
+         };
+       S99_verify:
+         \* Report success only after re-checking ownership: an operation that lost the lock while publishing
+         \* cannot claim its output is the one at the destination (this is what the prototype adds to Section 99).
+         if (crashed[self]) { goto publish_crashed; }
+         else {
+           if (StillOwned(self)) { verified[self] := TRUE; }
+           else { refused[self] := "TARGET_LOCK_BUSY"; refusedOk[self] := lostLock[self]; holding[self] := FALSE;
+                  goto S99_refuse_close; };
+         };
+       S99_write:
+         \* The write itself: a separate label, because the spec's check must come immediately before
+         \* it and another actor can act in between (design Section 11's check-to-call window). What
+         \* it writes is not part of the lock protocol here, so no object is created: the `nested`
+         \* scenario, which is about what gets written where, creates it.
+         if (crashed[self]) { goto publish_crashed; }
+         else {
+           writing[self] := TRUE;
+           writeStale[self] := FALSE;
+         };
+       S240_5_inflight_lands:
+         \* The issued write completes (Section 5.2). A takeover can land in between, and "a filesystem call it had
+         \* already started can still complete" (240.5).
+         if (crashed[self]) { goto publish_crashed; }
+         else {
+           if (writeStale[self]) { landedAfterTakeover := TRUE; };
+           writing[self] := FALSE;
+           \* Neither flag is read again until the next check or write sets it, so both go back to their initial
+           \* value: a state that differs only in them is the same state.
+           writeStale[self] := TRUE;
+         };
+       S99_release_check:
+         \* Section 99 lists unlink among the calls it guards, so the release is revalidated too (a reading
+         \* of the spec, recorded in trace.toml): a lock that is no longer this operation's is not removed.
+         if (crashed[self]) { goto publish_crashed; }
+         else {
+           checked[self] := FALSE;
+           checkStale[self] := TRUE;
+           if (~StillOwned(self)) {
+             refusedOk[self] := lostLock[self];
+             refused[self] := "TARGET_LOCK_BUSY";
+             holding[self] := FALSE;
+             goto S99_refuse_close;
+           };
+         };
+       S99_release:
+         \* The release unlink is issued: it resolves the lock path to a file now and removes that file's name when
+         \* it lands, as a system call resolves its path when it starts.
+         if (crashed[self]) { goto publish_crashed; }
+         else {
+           holding[self] := FALSE;
+           pendingUnlink[self] := LockObj;
+         };
+       S99_release_lands:
+         if (crashed[self]) { goto publish_crashed; }
+         else {
+           with (c \in FsUnlinkChoices) {
+             fs := LandUnlink(fs, self, c);
+           };
+           lostLock := IF pendingUnlink[self] # NoObj /\ LockObj # NoObj THEN MarkLost(self, LockObj) ELSE lostLock;
+           pendingUnlink[self] := NoObj;
+         };
+       S99_close:
+         if (crashed[self]) { goto publish_crashed; }
+         else {
+           \* Close the lock file's handle, which may no longer be at the lock path once the release unlink landed.
+           fs := FsCloseAll(fs, self);
+           return;
+         };
+       S99_refuse_close:
+         \* A failed check stops the operation, which gives up its handles and so its OS-native lock (design
+         \* Section 6.1): close every handle this process holds.
+         if (crashed[self]) { goto publish_crashed; }
+         else {
+           fs := FsCloseAll(fs, self);
+           return;
+         };
+       publish_crashed:
+         checked[self] := FALSE;
+         checkStale[self] := TRUE;
+         return;
+     }
+
+     \* A normal operation: acquire the lock, publish, release.
+     fair process (own \in Owners)
+     {
+       own_start:
+         if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
+           \* 235.1: without verified OS-native locks, an operation needing target exclusivity refuses.
+           refused[self] := "REMOTE_LOCK_UNSAFE";
+           goto own_end;
+         }
+         else {
+           live[self] := TRUE;
+           call Acquire();
+         };
+       own_publish:
+         if (~crashed[self] /\ holding[self]) { call Publish(); };
+       own_end:
+         live[self] := FALSE;
+     }
+
+     \* A new invocation with no flags (21.1): classify what it finds, then act or refuse.
+     fair process (plain \in PlainRuns)
+     {
+       plain_start:
+         if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
+           \* 235.1: without verified OS-native locks, an operation needing target exclusivity refuses.
+           refused[self] := "REMOTE_LOCK_UNSAFE";
+           goto plain_end;
+         }
+         else {
+           live[self] := TRUE;
+           call Classify(FALSE);
+         };
+       S21_1_decide:
+         if (crashed[self]) { goto plain_end; }
+         else {
+           refusedOk[self] := RefusalEvidence(self);
+           if (classified[self] = "empty") { goto plain_acquire; }
+           else if (Replaceable(self) /\ classified[self] = "cleanuplock") {
+             \* A cleanup lock names no resumable operation (259.6), so a dead one is removed as 240.3
+             \* describes and this invocation proceeds (21.1).
+             goto plain_recover;
+           }
+           else if (classified[self] = "live" \/ (SEED_DEAD_AS_BUSY /\ classified[self] = "dead")) {
+             refused[self] := "TARGET_LOCK_BUSY";
+           }
+         else if (classified[self] = "uncertain" \/ ownerLive[self] = "uncertain") {
+           refused[self] := "TARGET_LOCK_UNCERTAIN";
+         }
+         else if (classified[self] = "foreign") { refused[self] := "CONTROL_PLANE_NAMESPACE_CONFLICT"; }
+         else if (classified[self] = "cleanuplock") { refused[self] := "TARGET_LOCK_BUSY"; }
+         else {
+           \* A resumable prior operation, with neither --resume nor --restart: refuse without
+           \* mutating anything (21.1).
+             refused[self] := "RESUMABLE_OPERATION_EXISTS";
+           };
+         };
+       S21_1_refused:
+         goto plain_end;
+       plain_recover:
+         call Recover();
+       plain_recovered:
+         if (~crashed[self] /\ holding[self]) { call Publish(); };
+       plain_recovered_done:
+         goto plain_end;
+       plain_acquire:
+         call Acquire();
+       plain_publish:
+         if (~crashed[self] /\ holding[self]) { call Publish(); };
+       plain_end:
+         live[self] := FALSE;
+     }
+
+     \* A new invocation that finds a dead owner's lock, recovers it (240.3), then continues as an
+     \* owner: the recovery path of 21.1 step 1.
+     fair process (rec \in Recoverers)
+     {
+       rec_start:
+         if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
+           \* 235.1: without verified OS-native locks, an operation needing target exclusivity refuses.
+           refused[self] := "REMOTE_LOCK_UNSAFE";
+           goto rec_end;
+         }
+         else {
+           live[self] := TRUE;
+           call Classify(TRUE);
+         };
+       rec_decide:
+         if (crashed[self]) { goto rec_end; }
+         else {
+           refusedOk[self] := RefusalEvidence(self);
+           if (Replaceable(self)) { goto rec_recover; }
+           else if (classified[self] = "empty") { goto rec_acquire; }
+           else if (classified[self] = "uncertain" \/ ownerLive[self] = "uncertain") {
+             refused[self] := "TARGET_LOCK_UNCERTAIN";
+           }
+           else if (classified[self] = "foreign") { refused[self] := "CONTROL_PLANE_NAMESPACE_CONFLICT"; }
+           else { refused[self] := "TARGET_LOCK_BUSY"; };
+         };
+       rec_refused:
+         goto rec_end;
+       rec_recover:
+         call Recover();
+       rec_publish:
+         if (~crashed[self] /\ holding[self]) { call Publish(); };
+       rec_publish_done:
+         goto rec_end;
+       rec_acquire:
+         call Acquire();
+       rec_acquired:
+         if (~crashed[self] /\ holding[self]) { call Publish(); };
+       rec_end:
+         live[self] := FALSE;
+     }
+
+     \* flux cleanup DEST: classify the lock, remove a dead owner's or a dead cleanup lock through
+     \* 240.3 under its own cleanup lock, then delete that lock last (251.1, 259.6).
+     fair process (clean \in Cleanups)
+     {
+       clean_start:
+         if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
+           \* 235.1: without verified OS-native locks, an operation needing target exclusivity refuses.
+           refused[self] := "REMOTE_LOCK_UNSAFE";
+           goto clean_end;
+         }
+         else {
+           live[self] := TRUE;
+           call Classify(TRUE);
+         };
+       S251_1_classify:
+         if (crashed[self]) { goto clean_end; }
+         else {
+           refusedOk[self] := RefusalEvidence(self);
+           if (Replaceable(self)) { goto clean_recover; }
+           else if (classified[self] = "empty") { refused[self] := "NOTHING_TO_CLEAN"; }
+           else if (classified[self] = "foreign") { refused[self] := "CONTROL_PLANE_NAMESPACE_CONFLICT"; }
+           else if (classified[self] = "uncertain" \/ ownerLive[self] = "uncertain") {
+             \* Artifacts of uncertain ownership need `flux cleanup --target PATH --break-lock` (251.2).
+             refused[self] := "TARGET_LOCK_UNCERTAIN";
+           }
+           else { refused[self] := "TARGET_LOCK_BUSY"; };
+         };
+       clean_refused:
+         goto clean_end;
+       clean_recover:
+         call Recover();
+       S251_1_delete:
+         \* Its own cleanup lock goes last, while it still holds the OS-native lock (240.5, 251.1).
+         if (crashed[self]) { goto clean_end; }
+         else {
+           if (holding[self]) {
+             holding[self] := FALSE;
+             with (c \in FsUnlinkChoices) { fs := FsUnlink(fs, P, LockName, c).fs; };
+             lostLock := MarkLost(self, LockObj);
+         };
+         };
+       S251_1_close:
+         if (crashed[self]) { goto clean_end; }
+         else {
+           if (LockObj # NoObj /\ OpenBy(fs, self, LockObj)) { fs := FsClose(fs, self, LockObj).fs; };
+         };
+       clean_end:
+         live[self] := FALSE;
+     }
+
+     \* flux copy --restart --break-lock (21.1, 240.5). It classifies the lock first (the reported holder
+     \* 240.5 reads before acting). A dead owner's lock is replaced through 240.3, as 21.1 step 1 says; an
+     \* uncertain one is taken over in place; anything else is handled as a plain rerun would. Holding
+     \* the lock, it then revalidates (21.1 step 3) and rewrites the record for the new operation (step 5),
+     \* and continues as an Owner. 21.1 steps 2 and 4 change only the prior operation's state, which is
+     \* not modelled.
+     fair process (brk \in Breakers)
+     {
+       brk_start:
+         if (LockCapability = "weak" /\ ~SEED_NO_CAPABILITY_GATE) {
+           \* 235.1: without verified OS-native locks, an operation needing target exclusivity refuses.
+           refused[self] := "REMOTE_LOCK_UNSAFE";
+           goto brk_end;
+         }
+         else {
+           live[self] := TRUE;
+           call Classify(TRUE);
+         };
+       S21_1_restart_decide:
+         if (crashed[self]) { goto brk_end; }
+         else {
+           refusedOk[self] := RefusalEvidence(self);
+           if (Replaceable(self)) { goto brk_recover; }
+           else if (classified[self] = "empty") { goto brk_acquire; }
+           else if (classified[self] = "uncertain") {
+             \* SEED_MOVE_ASIDE_FOR_UNCERTAIN (design Section 8) moves the uncertain lock aside instead.
+             if (SEED_MOVE_ASIDE_FOR_UNCERTAIN) { goto brk_recover; } else { goto brk_takeover; };
+           }
+           else if (ownerLive[self] = "uncertain") { refused[self] := "TARGET_LOCK_UNCERTAIN"; }
+           else if (classified[self] = "foreign") { refused[self] := "CONTROL_PLANE_NAMESPACE_CONFLICT"; }
+           else { refused[self] := "TARGET_LOCK_BUSY"; };
+         };
+       brk_refused:
+         goto brk_end;
+       brk_takeover:
+         call TakeOver();
+       brk_took_over:
+         goto S21_1_s3;
+       brk_recover:
+         call Recover();
+       S21_1_s3:
+         \* Revalidate the lock it now holds (Section 99).
+         if (crashed[self] \/ ~holding[self]) { goto brk_end; }
+         else {
+           if (~StillOwned(self)) {
+             refusedOk[self] := lostLock[self];
+             refused[self] := "TARGET_LOCK_BUSY";
+             holding[self] := FALSE;
+             goto S21_1_s3_refuse_close;
+           };
+         };
+       S21_1_s5_write_begin:
+         \* The lock record is rewritten for the new operation, under the lock already held: through the
+         \* handle that holds it, not through a second lookup of the path (a reading, recorded in trace.toml).
+         if (crashed[self]) { goto brk_end; }
+         else {
+           \* The lease lapsed under this write: the descriptor is poisoned and the write fails (EIO).
+           if (WriteFenced(self, HandleObj(self))) {
+             refused[self] := "TARGET_LOCK_BUSY";
+             refusedOk[self] := lostLock[self];
+             holding[self] := FALSE;
+             goto S21_1_s3_refuse_close;
+           }
+           else {
+             \* SEED_RESTART_RELEASES (design Section 8) releases the OS-native lock here first.
+             fs := FsWriteBegin(IF SEED_RESTART_RELEASES THEN FsUnlock(fs, self, HandleObj(self)).fs ELSE fs,
+                                HandleObj(self)).fs;
+             lostLock := MarkLost(self, HandleObj(self));
+           };
+         };
+       S21_1_s5_write_end:
+         if (crashed[self]) { goto brk_end; }
+         else {
+           fs := FsWriteEnd(fs, HandleObj(self), OwnRecord(self)).fs;
+           lostLock := MarkLost(self, HandleObj(self));
+         };
+       brk_publish:
+         if (~crashed[self] /\ holding[self]) { call Publish(); };
+       brk_publish_done:
+         goto brk_end;
+       brk_acquire:
+         call Acquire();
+       brk_acquired:
+         if (~crashed[self] /\ holding[self]) { call Publish(); };
+       brk_acquired_done:
+         goto brk_end;
+       S21_1_s3_refuse_close:
+         if (crashed[self]) { goto brk_end; }
+         else {
+           fs := FsCloseAll(fs, self);
+         };
+       brk_end:
+         live[self] := FALSE;
+     }
+
+     \* The environment: the crashes of Section 5.2. A process crash releases the handles, their
+     \* sharing restrictions and the OS-native locks of the process it kills, and leaves everything it
+     \* wrote as it is, so a record write caught between its two halves stays torn. A host crash is a
+     \* process crash of every process that has started, and then resolves every unflushed object and
+     \* every unflushed entry operation. At most `MaxCrashes` crashes happen in a run, counted across
+     \* both kinds, and a host crash counts as one however many processes it stops.
+     \* Under `LockCapability = remote` it may also let a lock lease lapse under a live holder, at most
+     \* `MaxLeaseExpiries` times, counted apart from crashes (design Section 5.1).
+     process (env = "env")
+       variables crashes = 0, leases = 0;
+     {
+       env_loop:
+         while (crashes < MaxCrashes \/ leases < MaxLeaseExpiries) {
+           either {
+             \* Crash one running process.
+             await crashes < MaxCrashes;
+             with (p \in {q \in Procs : live[q] /\ ~crashed[q]}, land \in BOOLEAN, c \in FsUnlinkChoices) {
+               \* Its in-flight calls land or are dropped at the crash itself (design Section 5.2).
+               fs := FsProcCrash(LandUnlink(fs, IF land THEN p ELSE NoProc, c), p);
+               lostLock := IF land /\ pendingUnlink[p] # NoObj /\ LockObj # NoObj THEN MarkLost(p, LockObj) ELSE lostLock;
+               landedAfterTakeover := landedAfterTakeover \/ (land /\ writing[p] /\ writeStale[p]);
+               writing[p] := FALSE;
+               pendingUnlink[p] := NoObj;
+               crashed[p] := TRUE;
+               \* It loses its in-memory state (Section 5.2): it is no longer inside a publishing
+               \* step and no longer owns anything, whatever its lock file still says.
+               checked[p] := FALSE;
+               checkStale[p] := TRUE;
+               writeStale[p] := TRUE;
+               holding[p] := FALSE;
+               crashes := crashes + 1;
+             };
+           }
+           or {
+             \* The whole host goes down.
+             await HostCrashes /\ crashes < MaxCrashes;
+             \* Each in-flight call lands or is dropped at the crash (Section 5.2): at most one issued release unlink
+             \* can still name the lock file, so choosing one lander, or none, covers every outcome. What landed is
+             \* unflushed, so the host crash can undo it.
+             with (lander \in {NoProc} \cup {q \in Procs : live[q]}, c \in FsUnlinkChoices) {
+               with (pick \in HostCrashPicks(LandUnlink(fs, lander, c)), dirs \in HostCrashDirs) {
+                 \* An unflushed create, move-aside or removal at the lock path undone (Section 11).
+                 \* One line: a disjunct continued on the next line would split the translated action (TLC error 2109).
+                 hostCrashChangedLock := (hostCrashChangedLock \/ At(FsHostCrash(LandUnlink(fs, lander, c), pick, dirs), P, LockName) # At(LandUnlink(fs, lander, c), P, LockName));
+                 fs := FsHostCrash(LandUnlink(fs, lander, c), pick, dirs);
+               };
+             };
+             crashed := [q \in Procs |-> IF live[q] THEN TRUE ELSE crashed[q]];
+             \* The in-flight calls are resolved above; an in-flight data write's effect is not modelled (Section 5.2).
+             writing := [q \in Procs |-> IF live[q] THEN FALSE ELSE writing[q]];
+             pendingUnlink := [q \in Procs |-> IF live[q] THEN NoObj ELSE pendingUnlink[q]];
+             checked := [q \in Procs |-> IF live[q] THEN FALSE ELSE checked[q]];
+             checkStale := [q \in Procs |-> IF live[q] THEN TRUE ELSE checkStale[q]];
+             writeStale := [q \in Procs |-> IF live[q] THEN TRUE ELSE writeStale[q]];
+             holding := [q \in Procs |-> IF live[q] THEN FALSE ELSE holding[q]];
+             crashes := crashes + 1;
+           }
+           or {
+             \* A remote lock's lease lapses under a live holder, which is not told.
+             await LockCapability = "remote" /\ leases < MaxLeaseExpiries;
+             with (o \in {x \in Objs : fs.oslock[x] # NoProc /\ live[fs.oslock[x]] /\ ~crashed[fs.oslock[x]]}) {
+               \* Before fs: PlusCal reads fs as already assigned once it has been, so the holder must be read first.
+               lostLock[fs.oslock[o]] := TRUE;
+               fs := FsLeaseExpiry(fs, o).fs;
+               leases := leases + 1;
+             };
+           }
+           or {
+             \* Nothing crashes after all: the environment may simply stop.
+             goto env_done;
+           };
+         };
+       env_done:
+         skip;
+     }
+   } *)
