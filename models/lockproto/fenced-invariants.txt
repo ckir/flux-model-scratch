@@ -41,7 +41,11 @@ TargetComplete == TargetObj = NoObj \/ TargetContent \in Records
 \* No operation is ever entitled to report success over someone else's output: at the moment it re-checks
 \* its ownership and still holds the lock, the destination holds ITS output. A state predicate over the
 \* latch would be wrong - the next operation's legitimate publication would break it (measured).
-PublishedIsOwn == ~misreported
+PublishedIsOwn == \A p \in Procs : verified[p] => published[p]
+\* The ghost the earlier encoding used, kept as the statement of what a false success would be: set when an
+\* operation was entitled to report success while the destination held someone else's output. Never set once
+\* the check reads the destination back.
+NeverMisreported == ~misreported
 
 \* The witness that the prototype's runs reach a publication at all (otherwise the two above are vacuous).
 NeverPublished == \A p \in Procs : ~published[p]

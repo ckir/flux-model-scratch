@@ -745,11 +745,14 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          \* cannot claim its output is the one at the destination (this is what the prototype adds to Section 99).
          if (crashed[self]) { goto publish_crashed; }
          else {
-           if (StillOwned(self)) {
+           \* Measured (2026-09-16): re-checking the lock is not enough. A lease-lapsed operation's publication
+           \* rename is not fenced - a rename is a directory operation, and the EIO rule covers writes through
+           \* the descriptor whose lock was lost - so it can land after the rightful owner's and leave the
+           \* destination holding a stale operation's output. The check therefore READS THE DESTINATION BACK
+           \* and compares it: an operation reports success only for output it can still see at the
+           \* destination. It cannot stop the clobber; it can refuse to lie about it.
+           if (StillOwned(self) /\ TargetContent = OwnRecord(self)) {
              verified[self] := TRUE;
-             \* The question the prototype exists to answer: at the moment an operation is entitled to report
-             \* success, is its own output the one at the destination?
-             if (TargetContent # OwnRecord(self)) { misreported := TRUE; };
            }
            else { refused[self] := "TARGET_LOCK_BUSY"; refusedOk[self] := lostLock[self]; holding[self] := FALSE;
                   goto S99_refuse_close; };
@@ -1162,7 +1165,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "f6e4cfc9" /\ chksum(tla) = "22773410")
+\* BEGIN TRANSLATION (chksum(pcal) = "4ff5216f" /\ chksum(tla) = "39bbea41")
 \* Procedure variable obj of procedure Classify at line 188 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -2578,14 +2581,10 @@ S99_pub_rename(self) == /\ pc[self] = "S99_pub_rename"
 S99_verify(self) == /\ pc[self] = "S99_verify"
                     /\ IF crashed[self]
                           THEN /\ pc' = [pc EXCEPT ![self] = "publish_crashed"]
-                               /\ UNCHANGED << holding, verified, misreported, 
-                                               refusedOk, refused >>
-                          ELSE /\ IF StillOwned(self)
+                               /\ UNCHANGED << holding, verified, refusedOk, 
+                                               refused >>
+                          ELSE /\ IF StillOwned(self) /\ TargetContent = OwnRecord(self)
                                      THEN /\ verified' = [verified EXCEPT ![self] = TRUE]
-                                          /\ IF TargetContent # OwnRecord(self)
-                                                THEN /\ misreported' = TRUE
-                                                ELSE /\ TRUE
-                                                     /\ UNCHANGED misreported
                                           /\ pc' = [pc EXCEPT ![self] = "S99_write"]
                                           /\ UNCHANGED << holding, refusedOk, 
                                                           refused >>
@@ -2593,13 +2592,13 @@ S99_verify(self) == /\ pc[self] = "S99_verify"
                                           /\ refusedOk' = [refusedOk EXCEPT ![self] = lostLock[self]]
                                           /\ holding' = [holding EXCEPT ![self] = FALSE]
                                           /\ pc' = [pc EXCEPT ![self] = "S99_refuse_close"]
-                                          /\ UNCHANGED << verified, 
-                                                          misreported >>
+                                          /\ UNCHANGED verified
                     /\ UNCHANGED << fs, foreignObj, classified, ownerLive, 
                                     sawLive, seenRec, crashed, live, checked, 
                                     writing, pendingUnlink, checkStale, 
                                     writeStale, lostLock, landedAfterTakeover, 
-                                    published, recoveredAfterCrash, tornRead, 
+                                    published, misreported, 
+                                    recoveredAfterCrash, tornRead, 
                                     hostCrashChangedLock, touchedUncertain, 
                                     stack, keep, obj_, got, obj, robj, victim, 
                                     nobj, tobj, crashes, leases >>
@@ -3843,7 +3842,11 @@ TargetComplete == TargetObj = NoObj \/ TargetContent \in Records
 \* No operation is ever entitled to report success over someone else's output: at the moment it re-checks
 \* its ownership and still holds the lock, the destination holds ITS output. A state predicate over the
 \* latch would be wrong - the next operation's legitimate publication would break it (measured).
-PublishedIsOwn == ~misreported
+PublishedIsOwn == \A p \in Procs : verified[p] => published[p]
+\* The ghost the earlier encoding used, kept as the statement of what a false success would be: set when an
+\* operation was entitled to report success while the destination held someone else's output. Never set once
+\* the check reads the destination back.
+NeverMisreported == ~misreported
 
 \* The witness that the prototype's runs reach a publication at all (otherwise the two above are vacuous).
 NeverPublished == \A p \in Procs : ~published[p]
