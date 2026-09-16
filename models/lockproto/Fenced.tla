@@ -754,8 +754,14 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
            if (StillOwned(self) /\ TargetContent = OwnRecord(self)) {
              verified[self] := TRUE;
            }
-           else { refused[self] := "TARGET_LOCK_BUSY"; refusedOk[self] := lostLock[self]; holding[self] := FALSE;
-                  goto S99_refuse_close; };
+           else {
+             \* Not TARGET_LOCK_BUSY: the lock is not what failed. Either this operation lost it, or its output
+             \* was replaced at the destination by an operation whose lease had lapsed. A distinct reason, which
+             \* the spec does not have today - the caller needs to know its work did not survive.
+             refused[self] := "DESTINATION_REPLACED";
+             holding[self] := FALSE;
+             goto S99_refuse_close;
+           };
          };
        S99_write:
          \* The write itself: a separate label, because the spec's check must come immediately before
@@ -1165,7 +1171,7 @@ Judgements == {"none", "empty", "foreign", "uncertain", "cleanuplock", "live", "
          skip;
      }
    } *)
-\* BEGIN TRANSLATION (chksum(pcal) = "4ff5216f" /\ chksum(tla) = "39bbea41")
+\* BEGIN TRANSLATION (chksum(pcal) = "314536b3" /\ chksum(tla) = "c44c3906")
 \* Procedure variable obj of procedure Classify at line 188 col 18 changed to obj_
 CONSTANT defaultInitValue
 VARIABLES fs, foreignObj, classified, ownerLive, sawLive, seenRec, crashed, 
@@ -2581,15 +2587,12 @@ S99_pub_rename(self) == /\ pc[self] = "S99_pub_rename"
 S99_verify(self) == /\ pc[self] = "S99_verify"
                     /\ IF crashed[self]
                           THEN /\ pc' = [pc EXCEPT ![self] = "publish_crashed"]
-                               /\ UNCHANGED << holding, verified, refusedOk, 
-                                               refused >>
+                               /\ UNCHANGED << holding, verified, refused >>
                           ELSE /\ IF StillOwned(self) /\ TargetContent = OwnRecord(self)
                                      THEN /\ verified' = [verified EXCEPT ![self] = TRUE]
                                           /\ pc' = [pc EXCEPT ![self] = "S99_write"]
-                                          /\ UNCHANGED << holding, refusedOk, 
-                                                          refused >>
-                                     ELSE /\ refused' = [refused EXCEPT ![self] = "TARGET_LOCK_BUSY"]
-                                          /\ refusedOk' = [refusedOk EXCEPT ![self] = lostLock[self]]
+                                          /\ UNCHANGED << holding, refused >>
+                                     ELSE /\ refused' = [refused EXCEPT ![self] = "DESTINATION_REPLACED"]
                                           /\ holding' = [holding EXCEPT ![self] = FALSE]
                                           /\ pc' = [pc EXCEPT ![self] = "S99_refuse_close"]
                                           /\ UNCHANGED verified
@@ -2600,8 +2603,8 @@ S99_verify(self) == /\ pc[self] = "S99_verify"
                                     published, misreported, 
                                     recoveredAfterCrash, tornRead, 
                                     hostCrashChangedLock, touchedUncertain, 
-                                    stack, keep, obj_, got, obj, robj, victim, 
-                                    nobj, tobj, crashes, leases >>
+                                    refusedOk, stack, keep, obj_, got, obj, 
+                                    robj, victim, nobj, tobj, crashes, leases >>
 
 S99_write(self) == /\ pc[self] = "S99_write"
                    /\ IF crashed[self]
