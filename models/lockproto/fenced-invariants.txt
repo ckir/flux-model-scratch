@@ -38,10 +38,10 @@ SingleWriter == Cardinality({p \in Procs : (checked[p] \/ writing[p]) /\ ~Supers
 \* file that was finished before it got the name.
 TargetComplete == TargetObj = NoObj \/ TargetContent \in Records
 
-\* An operation that re-checked its ownership after publishing, and still owned the lock, was not
-\* overwritten: what it reports as the destination's content is what the destination holds. An
-\* operation that lost the lock reports a refusal instead, so no one is told a lie.
-PublishedIsOwn == \A p \in Procs : verified[p] => TargetContent = OwnRecord(p)
+\* No operation is ever entitled to report success over someone else's output: at the moment it re-checks
+\* its ownership and still holds the lock, the destination holds ITS output. A state predicate over the
+\* latch would be wrong - the next operation's legitimate publication would break it (measured).
+PublishedIsOwn == ~misreported
 
 \* The witness that the prototype's runs reach a publication at all (otherwise the two above are vacuous).
 NeverPublished == \A p \in Procs : ~published[p]

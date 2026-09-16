@@ -33,6 +33,7 @@
        landedAfterTakeover = FALSE,               \* witness: a write issued in an earlier generation landed
        published = [p \in Procs |-> FALSE],       \* ghost: its output is at the destination, or was
        verified = [p \in Procs |-> FALSE],        \* ghost: after publishing, it re-checked and still owned the lock
+       misreported = FALSE,                       \* ghost: an operation verified its ownership while the destination held someone else's output
        recoveredAfterCrash = FALSE,               \* witness: a lock left by a crash was replaced
        tornRead = FALSE,                          \* witness: a process read a torn record
        hostCrashChangedLock = FALSE,              \* witness: a host crash changed what is at the lock path
@@ -670,7 +671,12 @@
          \* cannot claim its output is the one at the destination (this is what the prototype adds to Section 99).
          if (crashed[self]) { goto publish_crashed; }
          else {
-           if (StillOwned(self)) { verified[self] := TRUE; }
+           if (StillOwned(self)) {
+             verified[self] := TRUE;
+             \* The question the prototype exists to answer: at the moment an operation is entitled to report
+             \* success, is its own output the one at the destination?
+             if (TargetContent # OwnRecord(self)) { misreported := TRUE; };
+           }
            else { refused[self] := "TARGET_LOCK_BUSY"; refusedOk[self] := lostLock[self]; holding[self] := FALSE;
                   goto S99_refuse_close; };
          };
